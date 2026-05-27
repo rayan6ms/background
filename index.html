@@ -1,73 +1,749 @@
 <!DOCTYPE html>
 <html lang="pt-BR">
+
 <head>
-  <meta charset="UTF-8"/>
+  <meta charset="UTF-8" />
   <title>rayan6ms background</title>
   <script src="https://cdn.jsdelivr.net/npm/p5@1.6.0/lib/p5.js"></script>
 </head>
 
 <body style="margin: 0; padding: 0; overflow: hidden;">
   <script>
+    // =========================
+    // Globals
+    // =========================
     let baseColor, secondColor, thirdColor, fourthColor;
+
     let time = 0;
     let noiseScale = 0.002;
     let cellSize = 20;
 
+    // --- UI / modes ---
+    let mode = "original";
+
+    const MODES = [
+      { key: "original", label: "Original" },
+      { key: "octaves", label: "Octaves" },
+      { key: "domainWarp", label: "Domain Warp" },
+      { key: "ridged", label: "Ridged" },
+      { key: "glitchQuant", label: "Glitch Quantize" },
+      { key: "flowField", label: "Flow Field" },
+      { key: "shaderSmoke", label: "Shader: Smoke" },
+      { key: "shaderMarble", label: "Shader: Marble" },
+    ];
+
+    // --- UI elements ---
+    let uiWrapper, toolbar, flowControls, hotZone;
+    let hideTimer = null;
+
+    // --- Flow field ---
+    let flowPg;
+    let particles = [];
+    let lastAppliedAmount = -1;
+
+    // sliders
+    let sAmount, sSize, sTrail, sTail;
+    let amountLabel, sizeLabel, trailLabel, tailLabel;
+
+    // --- Shaders ---
+    let shaderPg, shaderSmoke, shaderMarble;
+
+    // =========================
+    // Shader sources
+    // =========================
+    const vertSrc = `
+    attribute vec3 aPosition;
+    attribute vec2 aTexCoord;
+    varying vec2 vTexCoord;
+
+    uniform mat4 uModelViewMatrix;
+    uniform mat4 uProjectionMatrix;
+
+    void main() {
+      vTexCoord = aTexCoord;
+      gl_Position = uProjectionMatrix * uModelViewMatrix * vec4(aPosition, 1.0);
+    }
+  `;
+
+    // Smoke-ish (your current vibe, but slower + less directional)
+    const fragSmoke = `
+    precision highp float;
+    varying vec2 vTexCoord;
+
+    uniform vec2 uResolution;
+    uniform float uTime;
+
+    uniform vec3 uC1;
+    uniform vec3 uC2;
+    uniform vec3 uC3;
+    uniform vec3 uC4;
+
+    float hash(vec2 p){
+      p = fract(p*vec2(123.34, 456.21));
+      p += dot(p, p+45.32);
+      return fract(p.x*p.y);
+    }
+
+    float noise2(vec2 p){
+      vec2 i = floor(p);
+      vec2 f = fract(p);
+      float a = hash(i);
+      float b = hash(i + vec2(1.0, 0.0));
+      float c = hash(i + vec2(0.0, 1.0));
+      float d = hash(i + vec2(1.0, 1.0));
+      vec2 u = f*f*(3.0-2.0*f);
+      return mix(a, b, u.x) + (c-a)*u.y*(1.0-u.x) + (d-b)*u.x*u.y;
+    }
+
+    float fbm(vec2 p){
+      float v = 0.0;
+      float a = 0.5;
+      mat2 m = mat2(1.7, 1.2, -1.2, 1.7);
+      for(int i=0;i<5;i++){
+        v += a * noise2(p);
+        p = m*p;
+        a *= 0.55;
+      }
+      return v;
+    }
+
+    vec3 ramp4(float t, vec3 c1, vec3 c2, vec3 c3, vec3 c4){
+      t = clamp(t, 0.0, 1.0);
+      if(t < 0.33){
+        float k = smoothstep(0.0, 0.33, t);
+        return mix(c1, c2, k);
+      } else if(t < 0.66){
+        float k = smoothstep(0.33, 0.66, t);
+        return mix(c2, c3, k);
+      } else {
+        float k = smoothstep(0.66, 1.0, t);
+        return mix(c3, c4, k);
+      }
+    }
+
+    void main(){
+      vec2 uv = vTexCoord;
+      vec2 p = (uv * uResolution) / min(uResolution.x, uResolution.y);
+
+      float t = uTime * 0.10;
+      p += vec2(0.55*sin(t*0.9), 0.55*cos(t*0.7));
+
+      vec2 q = vec2(
+        fbm(p*1.25 + vec2(0.0, t)),
+        fbm(p*1.25 + vec2(5.2, t))
+      );
+
+      vec2 r = vec2(
+        fbm(p*2.1 + 2.0*q + vec2(1.7, t*1.1)),
+        fbm(p*2.1 + 2.0*q + vec2(9.2, t*1.1))
+      );
+
+      float n = fbm(p*2.3 + 1.7*r);
+      n = smoothstep(0.12, 0.95, n);
+
+      vec3 col = ramp4(n, uC1, uC2, uC3, uC4);
+
+      vec2 c = uv - 0.5;
+      float v = smoothstep(0.9, 0.22, dot(c,c)*2.2);
+      col *= (0.86 + 0.25*v);
+
+      gl_FragColor = vec4(col, 1.0);
+    }
+  `;
+
+    // Marble / liquid stone (not smoke)
+    const fragMarble = `
+    precision highp float;
+    varying vec2 vTexCoord;
+
+    uniform vec2 uResolution;
+    uniform float uTime;
+
+    uniform vec3 uC1;
+    uniform vec3 uC2;
+    uniform vec3 uC3;
+    uniform vec3 uC4;
+
+    float hash(vec2 p){
+      p = fract(p*vec2(127.1, 311.7));
+      p += dot(p, p+34.5);
+      return fract(p.x*p.y);
+    }
+
+    float noise2(vec2 p){
+      vec2 i = floor(p);
+      vec2 f = fract(p);
+      float a = hash(i);
+      float b = hash(i + vec2(1.0, 0.0));
+      float c = hash(i + vec2(0.0, 1.0));
+      float d = hash(i + vec2(1.0, 1.0));
+      vec2 u = f*f*(3.0-2.0*f);
+      return mix(a, b, u.x) + (c-a)*u.y*(1.0-u.x) + (d-b)*u.x*u.y;
+    }
+
+    float fbm(vec2 p){
+      float v = 0.0;
+      float a = 0.5;
+      mat2 m = mat2(1.9, 1.1, -1.1, 1.9);
+      for(int i=0;i<6;i++){
+        v += a * noise2(p);
+        p = m*p;
+        a *= 0.55;
+      }
+      return v;
+    }
+
+    vec3 ramp4(float t, vec3 c1, vec3 c2, vec3 c3, vec3 c4){
+      t = clamp(t, 0.0, 1.0);
+      if(t < 0.33){
+        float k = smoothstep(0.0, 0.33, t);
+        return mix(c1, c2, k);
+      } else if(t < 0.66){
+        float k = smoothstep(0.33, 0.66, t);
+        return mix(c2, c3, k);
+      } else {
+        float k = smoothstep(0.66, 1.0, t);
+        return mix(c3, c4, k);
+      }
+    }
+
+    void main(){
+      vec2 uv = vTexCoord;
+      vec2 p = (uv * uResolution) / min(uResolution.x, uResolution.y);
+
+      float t = uTime * 0.08;
+
+      // marble: sin() of a warped coordinate
+      float w = fbm(p*2.2 + vec2(t*0.9, -t*0.7));
+      float veins = sin((p.x*3.2 + p.y*1.6) + w*6.0);
+
+      // add a second warp so it feels liquid, not stripes
+      float w2 = fbm(p*3.3 + vec2(-t*0.6, t*1.0));
+      veins += 0.65*sin((p.x*1.3 - p.y*2.2) + w2*5.0);
+
+      float n = 0.5 + 0.5*veins;
+      n = smoothstep(0.05, 0.95, n);
+
+      vec3 col = ramp4(n, uC1, uC2, uC3, uC4);
+
+      // slight specular-ish pop
+      float g = pow(clamp(1.0 - abs(veins), 0.0, 1.0), 8.0);
+      col += g * 0.10;
+
+      // vignette
+      vec2 c = uv - 0.5;
+      float v = smoothstep(0.9, 0.18, dot(c,c)*2.0);
+      col *= (0.85 + 0.28*v);
+
+      gl_FragColor = vec4(col, 1.0);
+    }
+  `;
+
+    // =========================
+    // p5 setup/draw
+    // =========================
     function setup() {
       createCanvas(windowWidth, windowHeight);
       pixelDensity(1);
       colorMode(RGB);
+      noStroke();
 
       selectColors();
 
+      createUI();            // wrapper + hover animation
+      createToolbar();       // buttons
+      createFlowControls();  // sliders (shown only in Flow Field mode)
+
+      initFlowBuffer();
+      rebuildParticles(true);
+
+      initShaders();
+      pushPaletteToShaders();
+
       setInterval(() => {
         selectColors();
+        pushPaletteToShaders();
       }, 10 * 60 * 1000);
     }
 
     function draw() {
-      background(255, 255, 255, 25);
-      drawGrid();
+      renderCurrentMode();
       time += 0.006;
     }
 
     function windowResized() {
       resizeCanvas(windowWidth, windowHeight);
+      initFlowBuffer();
+      rebuildParticles(true);
+      initShaders();
+      pushPaletteToShaders();
     }
 
+    // =========================
+    // Render per mode
+    // =========================
+    function renderCurrentMode() {
+      // show sliders only in flowField mode
+      flowControls.style("display", mode === "flowField" ? "flex" : "none");
+
+      if (mode === "flowField") {
+        renderFlowField();
+        return;
+      }
+
+      if (mode === "shaderSmoke") {
+        renderShader(shaderSmoke, time * 3.0);
+        return;
+      }
+
+      if (mode === "shaderMarble") {
+        renderShader(shaderMarble, time * 2.2);
+        return;
+      }
+
+      // grid modes
+      background(255, 255, 255, 25);
+      drawGrid();
+    }
+
+    // =========================
+    // Grid modes
+    // =========================
     function drawGrid() {
       for (let x = 0; x < width; x += cellSize) {
         for (let y = 0; y < height; y += cellSize) {
-          let noiseVal = noise(x * noiseScale + time, y * noiseScale);
-          let col;
-
-          if (noiseVal < 0.33) {
-            col = lerpColor(
-              baseColor,
-              secondColor,
-              map(noiseVal, 0, 0.33, 0, 1)
-            );
-          } else if (noiseVal < 0.66) {
-            col = lerpColor(
-              secondColor,
-              thirdColor,
-              map(noiseVal, 0.33, 0.66, 0, 1)
-            );
-          } else {
-            col = lerpColor(
-              thirdColor,
-              fourthColor,
-              map(noiseVal, 0.66, 1, 0, 1)
-            );
-          }
-
-          noStroke();
+          const v = getNoiseValueForMode(x, y);
+          const col = colorRamp4(v);
           fill(col);
           rect(x, y, cellSize, cellSize);
         }
       }
     }
 
+    function getNoiseValueForMode(x, y) {
+      const nx = x * noiseScale;
+      const ny = y * noiseScale;
+
+      if (mode === "original") {
+        return noise(nx + time, ny);
+      }
+
+      if (mode === "octaves") {
+        return fbm3(nx, ny, time * 0.8, 5, 2.0, 0.5);
+      }
+
+      if (mode === "domainWarp") {
+        const warp = 0.85;
+        const qx = (noise(nx * 2.0, ny * 2.0, time) - 0.5) * warp;
+        const qy = (noise(nx * 2.0 + 1000, ny * 2.0 + 1000, time) - 0.5) * warp;
+        return fbm3(nx + qx, ny + qy, time * 0.7, 4, 2.0, 0.55);
+      }
+
+      if (mode === "ridged") {
+        let v = fbm3(nx, ny, time * 0.7, 5, 2.0, 0.5);
+        v = 1.0 - Math.abs(2.0 * v - 1.0);
+        v = pow(v, 1.6);
+        return constrain(v, 0, 1);
+      }
+
+      if (mode === "glitchQuant") {
+        // "spiced quantize": soft-banded + animated dither + tiny warp so it feels alive
+        const warp = 0.35;
+        const qx = (noise(nx * 1.6, ny * 1.6, time * 0.8) - 0.5) * warp;
+        const qy = (noise(nx * 1.6 + 77.0, ny * 1.6 + 11.0, time * 0.8) - 0.5) * warp;
+
+        let v = fbm3(nx + qx, ny + qy, time * 0.9, 4, 2.05, 0.55);
+
+        const levels = 6.0;
+        // animated dithering (breaks the "corny posterize" look)
+        const d = (noise(x * 0.045, y * 0.045, time * 2.4) - 0.5) * (1.0 / levels);
+        v = constrain(v + d, 0, 1);
+
+        // soft quantization (blend between raw and quantized)
+        const q = floor(v * levels) / (levels - 1.0);
+        v = lerp(q, v, 0.22);
+
+        // add a tiny "scan shimmer"
+        v += 0.03 * sin((y * 0.015) + time * 6.0);
+
+        return constrain(v, 0, 1);
+      }
+
+      return noise(nx, ny, time);
+    }
+
+    function fbm3(x, y, z, octaves = 5, lacunarity = 2.0, gain = 0.5) {
+      let sum = 0;
+      let amp = 0.5;
+      let freq = 1.0;
+      let norm = 0;
+
+      for (let i = 0; i < octaves; i++) {
+        sum += amp * noise(x * freq, y * freq, z);
+        norm += amp;
+        freq *= lacunarity;
+        amp *= gain;
+      }
+      return sum / norm;
+    }
+
+    // =========================
+    // Flow field (fast like earlier + sliders)
+    // =========================
+    function initFlowBuffer() {
+      flowPg = createGraphics(width, height);
+      flowPg.pixelDensity(1);
+      flowPg.background(255);
+    }
+
+    function ensureParticleCount(target) {
+      if (target === lastAppliedAmount) return;
+
+      // If increasing, push new particles
+      if (target > particles.length) {
+        for (let i = particles.length; i < target; i++) {
+          const x = random(width);
+          const y = random(height);
+          particles.push({ x, y, px: x, py: y });
+        }
+      } else {
+        // If decreasing, truncate
+        particles.length = target;
+      }
+
+      lastAppliedAmount = target;
+    }
+
+    function rebuildParticles(force = false) {
+      const target = int(sAmount ? sAmount.value() : 2200);
+      if (!force && target === lastAppliedAmount) return;
+
+      particles = [];
+      for (let i = 0; i < target; i++) {
+        const x = random(width);
+        const y = random(height);
+        particles.push({ x, y, px: x, py: y });
+      }
+      lastAppliedAmount = target;
+    }
+
+    function renderFlowField() {
+      const amount = int(sAmount.value());
+      const size = sSize.value() / 10.0;    // 0.1..6.0
+      const trail = int(sTrail.value());    // 0..100 (0 = infinite persistence)
+      const tail = int(sTail.value());      // 0..200 px
+
+      amountLabel.html(`Amount: ${amount}`);
+      sizeLabel.html(`Size: ${size.toFixed(1)}`);
+      trailLabel.html(`Trail (0=∞): ${trail}`);
+      tailLabel.html(`Tail: ${tail}px`);
+
+      // Adjust particle count without full rebuild
+      ensureParticleCount(amount);
+
+      // Fade old trails (0 => no fade => "infinite")
+      const fadeAlpha = map(trail, 0, 100, 0, 70);
+      flowPg.noStroke();
+      flowPg.fill(255, 255, 255, fadeAlpha);
+      flowPg.rect(0, 0, width, height);
+
+      flowPg.strokeWeight(size);
+
+      const t = time * 0.9;
+      const fieldScale = 0.0018;
+      const speed = 1.2;
+
+      for (let p of particles) {
+        // remember previous
+        p.px = p.x;
+        p.py = p.y;
+
+        // vector field angle
+        const n = noise(p.x * fieldScale, p.y * fieldScale, t);
+        const ang = n * TWO_PI * 4.0;
+
+        // move
+        p.x += cos(ang) * speed;
+        p.y += sin(ang) * speed;
+
+        // wrap WITHOUT drawing long wrap-lines (this removes those horizontal/vertical artifacts)
+        let wrapped = false;
+        if (p.x < 0) { p.x += width; wrapped = true; }
+        if (p.x > width) { p.x -= width; wrapped = true; }
+        if (p.y < 0) { p.y += height; wrapped = true; }
+        if (p.y > height) { p.y -= height; wrapped = true; }
+
+        if (wrapped) {
+          p.px = p.x;
+          p.py = p.y;
+          continue;
+        }
+
+        // gray trail segment (fast like the old version)
+        flowPg.stroke(0, 0, 0, 34);
+        flowPg.line(p.px, p.py, p.x, p.y);
+
+        // colored "comet" tail (cheap, no history loop)
+        const c = colorRamp4(n);
+        const dx = cos(ang);
+        const dy = sin(ang);
+
+        flowPg.stroke(red(c), green(c), blue(c), 120);
+        flowPg.line(p.x, p.y, p.x - dx * tail, p.y - dy * tail);
+      }
+
+      background(255);
+      image(flowPg, 0, 0);
+    }
+
+    // =========================
+    // Shaders (GPU)
+    // =========================
+    function initShaders() {
+      shaderPg = createGraphics(width, height, WEBGL);
+      shaderPg.pixelDensity(1);
+      shaderPg.noStroke();
+      shaderSmoke = shaderPg.createShader(vertSrc, fragSmoke);
+      shaderMarble = shaderPg.createShader(vertSrc, fragMarble);
+    }
+
+    function pushPaletteToShaders() {
+      if (!shaderPg) return;
+      // We set uniforms on whichever shader is active inside renderShader()
+    }
+
+    function setShaderPalette(sh) {
+      sh.setUniform("uResolution", [width, height]);
+      sh.setUniform("uC1", [red(baseColor) / 255, green(baseColor) / 255, blue(baseColor) / 255]);
+      sh.setUniform("uC2", [red(secondColor) / 255, green(secondColor) / 255, blue(secondColor) / 255]);
+      sh.setUniform("uC3", [red(thirdColor) / 255, green(thirdColor) / 255, blue(thirdColor) / 255]);
+      sh.setUniform("uC4", [red(fourthColor) / 255, green(fourthColor) / 255, blue(fourthColor) / 255]);
+    }
+
+    function renderShader(whichShader, tVal) {
+      shaderPg.shader(whichShader);
+      whichShader.setUniform("uTime", tVal);
+      setShaderPalette(whichShader);
+
+      // fullscreen rect in WEBGL buffer
+      shaderPg.rect(-width / 2, -height / 2, width, height);
+
+      image(shaderPg, 0, 0);
+    }
+
+    // =========================
+    // Color ramp (your original)
+    // =========================
+    function colorRamp4(noiseVal) {
+      if (noiseVal < 0.33) {
+        return lerpColor(baseColor, secondColor, map(noiseVal, 0, 0.33, 0, 1));
+      } else if (noiseVal < 0.66) {
+        return lerpColor(secondColor, thirdColor, map(noiseVal, 0.33, 0.66, 0, 1));
+      } else {
+        return lerpColor(thirdColor, fourthColor, map(noiseVal, 0.66, 1, 0, 1));
+      }
+    }
+
+    // =========================
+    // UI (hidden unless hovered + slide animation)
+    // =========================
+    function createUI() {
+      // hot zone to reveal UI (thin invisible strip at top)
+      hotZone = createDiv("");
+      hotZone.position(0, 0);
+      hotZone.style("position", "fixed");
+      hotZone.style("left", "0");
+      hotZone.style("top", "0");
+      hotZone.style("width", "100%");
+      hotZone.style("height", "10px");
+      hotZone.style("z-index", "9999");
+      hotZone.style("background", "transparent");
+
+      // wrapper that slides in/out
+      uiWrapper = createDiv();
+      uiWrapper.position(0, 0);
+      uiWrapper.style("position", "fixed");
+      uiWrapper.style("left", "0");
+      uiWrapper.style("top", "0");
+      uiWrapper.style("width", "100%");
+      uiWrapper.style("z-index", "9998");
+      uiWrapper.style("transform", "translateY(-120%)");
+      uiWrapper.style("opacity", "0");
+      uiWrapper.style("transition", "transform 260ms cubic-bezier(0.2, 0.9, 0.2, 1), opacity 180ms ease");
+      uiWrapper.style("pointer-events", "none"); // disabled until shown
+
+      const show = () => showUI();
+      const hide = () => scheduleHideUI();
+
+      hotZone.elt.addEventListener("mouseenter", show);
+      hotZone.elt.addEventListener("mousemove", show);
+
+      uiWrapper.elt.addEventListener("mouseenter", show);
+      uiWrapper.elt.addEventListener("mouseleave", hide);
+
+      // Mobile/touch: tap top strip to toggle
+      hotZone.elt.addEventListener("touchstart", (e) => {
+        e.preventDefault();
+        if (uiWrapper.elt.style.opacity === "1") hideUI();
+        else showUI();
+      }, { passive: false });
+    }
+
+    function showUI() {
+      if (hideTimer) { clearTimeout(hideTimer); hideTimer = null; }
+      uiWrapper.style("transform", "translateY(0)");
+      uiWrapper.style("opacity", "1");
+      uiWrapper.style("pointer-events", "auto");
+    }
+
+    function scheduleHideUI() {
+      if (hideTimer) clearTimeout(hideTimer);
+      hideTimer = setTimeout(() => hideUI(), 350);
+    }
+
+    function hideUI() {
+      uiWrapper.style("transform", "translateY(-120%)");
+      uiWrapper.style("opacity", "0");
+      uiWrapper.style("pointer-events", "none");
+    }
+
+    function createToolbar() {
+      toolbar = createDiv();
+      toolbar.parent(uiWrapper);
+      toolbar.style("display", "flex");
+      toolbar.style("gap", "8px");
+      toolbar.style("padding", "10px");
+      toolbar.style("box-sizing", "border-box");
+      toolbar.style("background", "rgba(255,255,255,0.70)");
+      toolbar.style("backdrop-filter", "blur(8px)");
+      toolbar.style("-webkit-backdrop-filter", "blur(8px)");
+      toolbar.style("border-bottom", "1px solid rgba(0,0,0,0.08)");
+      toolbar.style("flex-wrap", "wrap");
+
+      MODES.forEach(({ key, label }) => {
+        const btn = createButton(label);
+        btn.parent(toolbar);
+        btn.mousePressed(() => setMode(key));
+        styleButton(btn, key === mode);
+        btn.elt.dataset.modeKey = key;
+      });
+
+      const spacer = createDiv("");
+      spacer.parent(toolbar);
+      spacer.style("flex", "1");
+    }
+
+    function createFlowControls() {
+      flowControls = createDiv();
+      flowControls.parent(uiWrapper);
+      flowControls.style("display", "none");
+      flowControls.style("gap", "14px");
+      flowControls.style("padding", "10px");
+      flowControls.style("box-sizing", "border-box");
+      flowControls.style("background", "rgba(255,255,255,0.55)");
+      flowControls.style("backdrop-filter", "blur(8px)");
+      flowControls.style("-webkit-backdrop-filter", "blur(8px)");
+      flowControls.style("border-bottom", "1px solid rgba(0,0,0,0.06)");
+      flowControls.style("flex-wrap", "wrap");
+      flowControls.style("align-items", "center");
+
+      // Amount (keep sane ranges for performance)
+      const g1 = makeControlGroup(flowControls);
+      amountLabel = makeLabel(g1, "Amount:");
+      sAmount = createSlider(300, 6000, 2200, 50);
+      styleSlider(sAmount);
+      sAmount.parent(g1);
+
+      // Size
+      const g2 = makeControlGroup(flowControls);
+      sizeLabel = makeLabel(g2, "Size:");
+      sSize = createSlider(1, 60, 12, 1); // 0.1..6.0
+      styleSlider(sSize);
+      sSize.parent(g2);
+
+      // Trail persistence
+      const g3 = makeControlGroup(flowControls);
+      trailLabel = makeLabel(g3, "Trail (0=∞):");
+      sTrail = createSlider(0, 100, 12, 1);
+      styleSlider(sTrail);
+      sTrail.parent(g3);
+
+      // Tail length (colored)
+      const g4 = makeControlGroup(flowControls);
+      tailLabel = makeLabel(g4, "Tail:");
+      sTail = createSlider(0, 220, 24, 1);
+      styleSlider(sTail);
+      sTail.parent(g4);
+    }
+
+    function setMode(newMode) {
+      mode = newMode;
+
+      // reset flow canvas when entering flowField (optional but usually nicer)
+      if (mode === "flowField") {
+        initFlowBuffer();
+        rebuildParticles(true);
+      }
+
+      // update button styles
+      const buttons = toolbar.elt.querySelectorAll("button");
+      buttons.forEach(b => {
+        const isActive = b.dataset.modeKey === mode;
+        b.style.opacity = isActive ? "1" : "0.72";
+        b.style.transform = isActive ? "translateY(-1px)" : "translateY(0px)";
+        b.style.boxShadow = isActive
+          ? "0 6px 16px rgba(0,0,0,0.10)"
+          : "0 2px 8px rgba(0,0,0,0.06)";
+        b.style.border = isActive
+          ? "1px solid rgba(0,0,0,0.18)"
+          : "1px solid rgba(0,0,0,0.10)";
+      });
+    }
+
+    function styleButton(btn, active) {
+      btn.style("appearance", "none");
+      btn.style("border", active ? "1px solid rgba(0,0,0,0.18)" : "1px solid rgba(0,0,0,0.10)");
+      btn.style("background", "rgba(255,255,255,0.85)");
+      btn.style("padding", "8px 12px");
+      btn.style("border-radius", "999px");
+      btn.style("cursor", "pointer");
+      btn.style("font-family", "system-ui, -apple-system, Segoe UI, Roboto, Arial");
+      btn.style("font-size", "14px");
+      btn.style("line-height", "14px");
+      btn.style("opacity", active ? "1" : "0.72");
+      btn.style("box-shadow", active ? "0 6px 16px rgba(0,0,0,0.10)" : "0 2px 8px rgba(0,0,0,0.06)");
+      btn.style("transition", "transform 120ms ease, box-shadow 120ms ease, opacity 120ms ease");
+    }
+
+    function makeControlGroup(parent) {
+      const d = createDiv();
+      d.parent(parent);
+      d.style("display", "flex");
+      d.style("gap", "10px");
+      d.style("align-items", "center");
+      d.style("padding", "6px 10px");
+      d.style("border-radius", "14px");
+      d.style("background", "rgba(255,255,255,0.65)");
+      d.style("border", "1px solid rgba(0,0,0,0.06)");
+      return d;
+    }
+
+    function makeLabel(parent, text) {
+      const s = createSpan(text);
+      s.parent(parent);
+      s.style("font-family", "system-ui, -apple-system, Segoe UI, Roboto, Arial");
+      s.style("font-size", "13px");
+      s.style("white-space", "nowrap");
+      return s;
+    }
+
+    function styleSlider(sl) {
+      sl.style("width", "160px");
+    }
+
+    // =========================
+    // Your original color selection logic
+    // =========================
     function selectColors() {
       baseColor = getRandomColor();
       secondColor = getRandomColor();
@@ -103,5 +779,9 @@
       return sqrt(rDiff * rDiff + gDiff * gDiff + bDiff * bDiff);
     }
   </script>
+
+
+
 </body>
+
 </html>
